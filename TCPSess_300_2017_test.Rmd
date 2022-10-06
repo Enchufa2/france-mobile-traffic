@@ -1,0 +1,229 @@
+---
+title: "Income vs. traffic per inhabitant"
+output: html_notebook
+---
+
+```{r}
+library(dplyr, warn.conflicts = FALSE)
+library(ggplot2)
+library(data.table)
+
+name <- "TCPSess_300_2017_0"
+path <- paste0("data/", name, ".hourly.iris.fst")
+DT <- fst::read.fst(path, as.data.table=TRUE)
+```
+
+Income and population data have many variables. Let us start simply by considering the median income and total population.
+
+```{r}
+inc.pop <- 
+  readxl::read_excel("data/BASE_TD_FILO_DEC_IRIS_2014.xls", skip=5, progress=FALSE) %>%
+  left_join(
+    readxl::read_excel("data/BASE_TD_FILO_DISP_IRIS_2014.xls", skip=5, progress=FALSE)) %>%
+  left_join(
+    readxl::read_excel("data/base-ic-evol-struct-pop-2015.xls", skip=5, progress=FALSE)) %>%
+  dplyr::select(IRIS, DISP_MED14, P15_POP) %>%
+  rename(CODE_IRIS = IRIS) %>%
+  na.omit()
+
+inc.pop
+```
+
+Filter and normalize data by population for each IRIS zone, to obtain **bytes/inhabitant**.
+
+```{r}
+DT <- subset(DT, CODE_IRIS %in% inc.pop$CODE_IRIS)
+inc.pop <- subset(inc.pop, CODE_IRIS %in% DT$CODE_IRIS)
+
+DT <- merge(DT, inc.pop, by="CODE_IRIS")[, `:=`(
+  uplink=uplink/P15_POP, downlink=downlink/P15_POP, P15_POP=NULL)]
+```
+
+Get the aggregate activity per category and area just for **home hours** (e.g., weekdays between 18-7 h).
+
+```{r}
+is.home.hour <- function(ts, start=18, end=7) {
+  hday <- as.Date(c("2017-05-25", "2017-06-05")) # French holidays
+  wday <- lubridate::wday(ts, label=TRUE, week_start=1)
+  hour <- lubridate::hour(ts)
+  
+  in.interval <- if (start <= end)
+    (hour >= start) & (hour <= end)
+  else (hour >= start) | (hour <= end)
+  
+  in.interval & (wday %in% levels(wday)[1:5]) & !(as.Date(ts) %in% hday)
+}
+
+DT <- subset(DT, is.home.hour(ts)) # takes too much time
+
+DT <- DT[, .(uplink=sum(uplink), downlink=sum(downlink)),
+         by = .(date=as.Date(ts), CODE_IRIS, category, DISP_MED14)]
+
+path <- paste0("data/", name, ".homeagg.iris.fst")
+fst::write.fst(DT, path)
+```
+
+We first plot median income vs. MB/inhabitant for the whole dataset to see whether there is any evident global relationship. To deal with overplotting, data is binned in hexagonal regions. The gray scale represents counts in each bin.
+
+```{r}
+path <- paste0("data/", name, ".homeagg.iris.fst")
+DT <- fst::read.fst(path, as.data.table=TRUE)
+
+DT <- DT[, .(uplink=sum(uplink), downlink=sum(downlink)),
+         by=.(CODE_IRIS, category, DISP_MED14)]
+DT[, `:=`(uplink_cat=sum(uplink), downlink_cat=sum(downlink)), by=.(category)]
+DT[, `:=`(uplink_zon=sum(uplink), downlink_zon=sum(downlink)), by=.(CODE_IRIS)]
+DT[, `:=`(
+  uplink = (uplink / uplink_zon) / (uplink_cat / sum(uplink)),
+  downlink = (downlink / downlink_zon) / (downlink_cat / sum(downlink))
+)]
+DT[, `:=`(uplink_cat=NULL, downlink_cat=NULL)]
+```
+
+```{r}
+melt(DT, measure=c("downlink", "uplink")) %>%
+  ggplot() + theme_classic() +
+  aes(DISP_MED14, value) + facet_wrap("variable", scales="free_y") +
+  geom_hex(bins=100) +
+  scale_fill_gradient(low="#dddddd", high="black", trans="log") +
+  labs(x="Median income (disp) [€]", y="RCA", title="All categories")
+```
+
+There are some interesting things though if we explore the dataset by category:
+
+```{r}
+for (i in unique(DT$category)) {
+  p <- melt(DT[category == i,], measure=c("uplink", "downlink")) %>%
+    ggplot() + theme_classic() +
+    aes(DISP_MED14, value) + facet_wrap("variable", scales="free_y") +
+    geom_hex(bins=100) +
+    scale_fill_gradient(low="#dddddd", high="black", trans="log") +
+    labs(x="Median income (disp) [€]", y="RCA", title=i)
+  print(p)
+}
+```
+
+Uplink and downlink are highly correlated for all categories, so we drop uplink.
+
+### Pre-processing
+
+As a first step, we convert the dataset to numeric variables in the form of `category_uplink` and `category_downlink`. The day of the week may be important (or not), so in principle we keep it as a categorical variable:
+
+```{r}
+DT[, `:=`(uplink=NULL, uplink_zon=NULL)]
+DT <- dcast(DT, ... ~ category, value.var="downlink", fill=0)
+#DT[, `:=`(CODE_IRIS = NULL)]
+
+str(DT)
+```
+
+Another advantage of this transformation is that categories without any traffic in a particular IRIS zone in a particular day are automatically filled with zeroes.
+
+```{r}
+corrplot::corrplot(
+  cor(DT[,-(1:2)]), order="FPC", method="color", tl.cex=.6, pch.cex=.6,
+  p.mat=corrplot::cor.mtest(DT[,-(1:2)])$p, insig="pch", sig.level=.01)
+```
+
+```{r}
+clus <- Hmisc::varclus(as.matrix(DT[,-(1:2)]))
+plot(clus)
+```
+
+The next chunk pre-processes each variable to compute the z-score (centering and scaling), and then creates a 80-20 data partition for training and testing.
+
+```{r}
+#preProc <- caret::preProcess(DT[, -(1:2)], method=c("center", "scale"))
+
+# training & test
+train <- caret::createDataPartition(DT$DISP_MED14, p=.8, times=1, list=FALSE)
+#DT.train <- predict(preProc, DT[train,])
+#DT.test <- predict(preProc, DT[-train,])
+DT.train <- DT[train,]
+DT.test <- DT[-train,]
+```
+
+After several attempts with different tools and techniques (some of them take ages with this data set, some others lead to a memory overrun), we found that `h2o` is blazing fast, memory efficient, and allows us to explore several models.
+
+The first step is to initialize the package to make use all the locally available cores, and then convert the data sets to H2OFrames:
+
+```{r}
+library(h2o)
+
+# use all cores
+localH2O <- h2o.init(nthreads = -1)
+
+DT.train.h2o <- as.h2o(DT.train)
+DT.test.h2o <- as.h2o(DT.test)
+```
+
+### Generalised Linear Model
+
+```{r}
+glmFit <- h2o.glm(y="DISP_MED14", training_frame=DT.train.h2o, family="gaussian",
+                  validation_frame=DT.test.h2o)
+summary(glmFit)
+```
+
+```{r}
+pred <- as.data.frame(predict(glmFit, DT.test.h2o))[[1]]
+hist(pred - DT.test$DISP_MED14)
+```
+
+```{r}
+ggplot(head(h2o.varimp(glmFit), n=20)) + theme_classic() +
+  aes(forcats::fct_rev(forcats::fct_inorder(names)), coefficients, fill=sign) +
+  geom_col() + coord_flip() +
+  labs(title="Standardized Coef. Magnitudes", x=NULL)
+```
+
+Std. coefficients are still huge, which means that there is still a lot of colinearity across categories.
+
+### Random forest
+
+```{r}
+rfFit <- h2o.randomForest(y="DISP_MED14", training_frame=DT.train.h2o, ntrees=100,
+                          validation_frame=DT.test.h2o)
+summary(rfFit)
+```
+
+```{r}
+pred <- as.data.frame(predict(rfFit, DT.test.h2o))[[1]]
+hist(pred - DT.test$DISP_MED14)
+```
+
+A random forest gets slightly better results, but still quite bad (MAE ~ 3000 €). Variable importance, according to this approach, is the following:
+
+```{r}
+h2o.varimp_plot(rfFit)
+```
+
+### Dimensionality reduction
+
+```{r}
+DT.pca <- prcomp(DT[, -(1:2)], center=TRUE, scale.=TRUE)
+```
+
+```{r}
+ggbiplot::ggscreeplot(DT.pca) + theme_classic()
+```
+
+```{r}
+ggbiplot::ggbiplot(DT.pca, obs.scale=1, alpha=0.5) +
+  aes(color=DT$DISP_MED14) + theme_classic() +
+  scale_color_gradientn(colors=rainbow(5)) +
+  xlim(-10, 10) + ylim(-10, 10)
+```
+
+```{r}
+components <- 1:2
+DT.trans <- as.data.frame(predict(DT.pca)[, components])
+DT.trans$DISP_MED14 <- DT$DISP_MED14
+
+DT.train.h2o <- as.h2o(DT.trans[train,])
+DT.test.h2o <- as.h2o(DT.trans[-train,])
+
+glmFit <- h2o.glm(y="DISP_MED14", training_frame=DT.train.h2o, family="gaussian",
+                  validation_frame=DT.test.h2o)
+summary(glmFit)
+```

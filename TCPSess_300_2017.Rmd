@@ -1,0 +1,1118 @@
+---
+title: "App Behaviour"
+subtitle: "Exploring 1.5 months of data traffic from Orange France"
+output: 
+  html_notebook:
+    number_sections: true
+    df_print: paged
+    theme: united
+    toc: yes
+    toc_float: true
+---
+
+# Data description
+
+## Orange data set
+
+The data consists of two compressed CSV files, for May and June 2017 respectively: 66 GB (compressed) with around 3.7 billion records.
+
+```{bash}
+du -ch data/TCPSess_300_2017*.gz
+```
+
+```{bash}
+N=100000
+NSIZE=$(zcat data/TCPSess_300_2017*.gz | head -n$N | gzip | wc -c)
+SIZE=$(wc -c data/TCPSess_300_2017*.gz | tail -n1 | cut -d" " -f1)
+echo "$SIZE/$NSIZE*$N" | bc
+```
+
+There is no header, and each record is a list of 5 semicolon-separated values.
+
+```{bash}
+zcat data/TCPSess_300_2017*.gz | head
+```
+
+These fields are the following:
+
+1. (Integer) Unix timestamp.
+2. (String) Base Station (BS) identifier.
+3. (String) Traffic category identifier.
+4. (Float) Uplink bytes.
+5. (Float) Downlink bytes.
+
+There is one record per BS and category every 5 minutes, starting from mid-May. Category identifiers are mapped to the following categories (plus "other"):
+
+```{bash}
+head data/TCPSess_300_2017_service_categ2.csv
+```
+
+```{bash}
+awk -F"," '{print $1": "$2}' data/TCPSess_300_2017_service_categ2.csv | sort | uniq
+```
+
+Geolocation information for BSs is included in the following file, where the `hasdata` field indicates whether the BS id appears in the traffic data set.
+
+```{bash}
+head data/TCPSess_300_2017_nidt_xy_lonlat.csv
+```
+
+```{bash}
+tail -n+2 data/TCPSess_300_2017_nidt_xy_lonlat.csv | cut -d"," -f6 | sort | uniq -c
+```
+
+### Issues and comments
+
+- Sometimes there are several BS IDs that share the same location. Such cases should be managed properly.
+
+```{r}
+library(dplyr, warn.conflicts = FALSE)
+
+readr::read_csv("data/TCPSess_300_2017_nidt_xy_lonlat.csv") %>%
+  group_by(lon, lat) %>%
+  count() %>%
+  arrange(desc(n))
+```
+
+- Marco F. has been told that BS IDs ending in "FE" correspond to femtocells. It seems that these are already filtered, because there are no such IDs in our data set.
+
+- Apart from the category `o1` ("Others") there are records in the data set flagged as `other`. These two categories may be joined.
+
+- What about `NI` ("No info")?
+
+## Geographical data
+
+We downloaded the [*Contours...IRIS édition 2016*](http://professionnels.ign.fr/contoursiris) data set, which defines a polygon in a Lambert-93 projection for each IRIS zone in France, and an associated record containing the IRIS code, name and type among other info.
+
+```{r}
+library(raster)
+
+shp <- file.path("data", "CONTOURS-IRIS_2-1__SHP__FRA_2017-06-30",
+                   "CONTOURS-IRIS", "1_DONNEES_LIVRAISON_2016",
+                   "CONTOURS-IRIS_2-1_SHP_LAMB93_FE-2016", "CONTOURS-IRIS.shp")
+  
+france.iris <- shapefile(shp)
+france.iris
+plot(france.iris)
+```
+
+There are [several types of IRIS](https://www.insee.fr/fr/information/2438155) zones:
+
+```{r}
+unique(france.iris$TYP_IRIS)
+```
+
+- les IRIS d'habitat (code H): their population is generally between 1800 and 5000 inhabitants. They are homogeneous as to the type of habitat and their limits are based on the major cuts in the urban fabric (main roads, railways, rivers, etc.);
+- les IRIS d'activité (code A): they include around 1000 employees and have at least twice as many salaried jobs as the resident population;
+- les IRIS divers (code D): these are large, sparsely populated, specific areas (recreational parks, port areas, forests, etc.).
+
+For non-IRIS municipalities, the IRIS type is Z-coded.
+
+### Issues and comments
+
+- Should we filter out everything but type H?
+
+## Economic indicators
+
+Currently, we are using [*Revenus, pauvreté et niveau de vie en 2014 (IRIS)*](https://www.insee.fr/fr/statistiques/3288151). There are *revenus déclarés* and *revenus disponibles*. Each file contains a quite complete description of the income distribution (per decile) per IRIS zone. However, many IRIS zones are missing, because they do not share data for those zones with less than 1000 inhabitants due to privacy reasons. Note also that there are some missing values.
+
+```{r}
+DEC <- readxl::read_excel("data/BASE_TD_FILO_DEC_IRIS_2014.xls", skip=5, progress=FALSE)
+str(DEC)
+summary(DEC)
+```
+
+and this is the description of the variables:
+
+```{r}
+readxl::read_excel("data/BASE_TD_FILO_DEC_IRIS_2014.xls", 2, skip=5, progress=FALSE)
+```
+
+### Issues and comments
+
+- Find better sources.
+
+- Try [income-map.FR](https://github.com/pierre-lamarche/income-map.FR).
+
+## Population structure
+
+Currently, we are using [*Population en 2015*](https://www.insee.fr/fr/statistiques/3627376).
+
+```{r}
+POP <- readxl::read_excel("data/base-ic-evol-struct-pop-2015.xls", skip=5, progress=FALSE)
+str(POP)
+summary(POP)
+```
+
+and this is the description of the variables:
+
+```{r}
+readxl::read_excel("data/base-ic-evol-struct-pop-2015.xls", 2, skip=5, progress=FALSE)
+```
+
+# Data preparation
+
+All these data in just two text-based files are unmanageable. The first step is to slice those files into more manageable chunks and convert them into a compressed binary format. The following script reads the data and compresses them back into several files based on the category column.
+
+```{bash}
+cat data/split-by-category.sh
+```
+
+After the execution, we end up with the following structure:
+
+```{bash, eval=FALSE}
+./data/split-by-category.sh data/TCPSess_300_2017*.gz
+```
+
+
+```{bash}
+du -ch data/TCPSess_300_2017_0/*.gz
+```
+
+```{bash}
+zcat data/TCPSess_300_2017_0/c1.csv.gz | head
+```
+
+Then, the following R code reads all these files and serializes them using the [fst](https://cran.r-project.org/package=fst) format.
+
+```{r, eval=FALSE}
+library(data.table)
+library(fst)
+
+name <- "TCPSess_300_2017_0"
+col_names <- c("ts", "bs", "uplink", "downlink")
+col_classes <- c("integer", "character", "double", "double")
+
+cl <- parallel::makeForkCluster(2)
+
+pbapply::pbsapply(Sys.glob(file.path("data", name, "*.csv.gz")), function(x) {
+  ptm <- proc.time()
+  
+  x.name <- strsplit(basename(x), "\\.")[[1]][1]
+  DT <- fread(x, col.names=col_names, colClasses=col_classes)
+  
+  DT[, ts := anytime::anytime(ts)]
+  setkey(DT, ts, bs)
+  write.fst(DT, file.path("data", name, paste0(x.name, ".fst")))
+  
+  DT.hourly <- DT[, .(uplink=sum(uplink), downlink=sum(downlink)),
+                  by = .(ts=lubridate::floor_date(ts, unit="hours"), bs)]
+  write.fst(DT.hourly, file.path("data", name, paste0(x.name, ".hourly.fst")))
+  
+  (proc.time() - ptm)[["elapsed"]]
+}, cl=cl) -> x
+
+parallel::stopCluster(cl)
+```
+
+As a result, there are two sets of binary files:
+
+- Original data (every 5 minutes) per category (e.g., `c1.fst`).
+- Summarised data (every hour) per category (e.g., `c1.hourly.fst`).
+
+```{bash}
+du -ch data/TCPSess_300_2017_0/*.fst | head
+```
+
+Now, the `hourly` data set has a reasonable size, and can be fully loaded in memory:
+
+```{bash}
+du -csh data/TCPSess_300_2017_0/*.hourly.fst | tail -n1
+```
+
+# Data exploration
+
+## Traffic aggregations
+
+The following chunk loads the hourly data set into the `DT` variable:
+
+```{r}
+library(data.table)
+
+name <- "TCPSess_300_2017_0"
+files <- Sys.glob(file.path("data", name, "*.hourly.fst"))
+
+# full hourly data set
+DT <- rbindlist(pbapply::pblapply(files, function(x) {
+  DT <- fst::read.fst(x, as.data.table=TRUE)
+  DT[, category:=strsplit(basename(x), "\\.")[[1]][1]]
+}))
+```
+
+```{r}
+DT
+```
+
+In the following, we consider several aggregations:
+
+```{r}
+# aggregated by BS
+DT.bs <- DT[, .(uplink=sum(uplink), downlink=sum(downlink)), by = bs]
+
+# aggregated by category
+DT.cat <- DT[, .(uplink=sum(uplink), downlink=sum(downlink)), by = category]
+
+# bind of the last two
+DT.type <- rbind(
+  DT.bs[, .(uplink, downlink, type="BS")], 
+  DT.cat[, .(uplink, downlink, type="category")]
+)
+
+# aggregated by BS and category
+DT.sp <- DT[, .(uplink=sum(uplink), downlink=sum(downlink)), by = .(bs, category)]
+
+# aggregated by timestamp and category
+DT.ts <- DT[, .(uplink=sum(uplink), downlink=sum(downlink)), by = .(ts, category)]
+```
+
+## Distributions
+
+A simple scatter plot shows that a linear relationship can be expected between downlink and uplink when we analyse a certain BS. On the other hand, as expected, the downlink/uplink ratio is much more heterogeneous across categories.
+
+```{r}
+library(ggplot2)
+
+DT.type %>%
+  ggplot(aes(uplink/1e12, downlink/1e12)) + geom_point(alpha=0.2) +
+  facet_wrap("type", scales="free") + labs(y="Downlink [TB]", x="Uplink [TB]") +
+  geom_smooth(method="lm") +
+  ggpmisc::stat_poly_eq(aes(label=paste(stat(eq.label), stat(adj.rr.label), sep = "~~~~")), 
+               formula=y~x, parse=TRUE, rr.digits=3, coef.digits=2)
+```
+
+For most BSs, we expect the downlink traffic to be **~17 times** the uplink traffic.
+
+```{r}
+summary(lm(downlink ~ uplink, data=DT.bs))
+```
+
+These are the eCDF and ePDF. Downlink and uplink are similarly distributed, except for the tail.
+
+```{r}
+DT.type %>%
+  tidyr::gather(link, bytes, uplink, downlink) %>%
+  ggplot(aes(bytes/1e12, color=link)) + stat_ecdf() + #scale_x_log10() +
+  facet_grid("type", scales="free_x") + labs(y="eCDF", x="Traffic [TB]")
+```
+
+```{r}
+DT.type %>%
+  tidyr::gather(link, bytes, uplink, downlink) %>%
+  ggplot(aes(bytes, fill=link)) + stat_density() + scale_x_log10() +
+  facet_grid("type", scales="free") + labs(x="Traffic [B]") 
+```
+
+This is better appreciated in a Q-Q plot:
+
+```{r}
+library(ggpmisc)
+
+# Q-Q plot
+DT.type %>%
+  ggplot(aes(sort(uplink)/1e12, sort(downlink)/1e12)) + geom_point() +
+  facet_wrap("type", scales="free") +
+  labs(y="downlink sample [TB]", x="uplink sample [TB]", title="Q-Q plot") +
+  geom_smooth(method="lm", se=FALSE)
+```
+
+Both uplink and downlink are approximately Weibull-distributed with `shape=0.95`, i.e., almost exponentially distributed.
+
+```{r}
+dist <- "qweibull";
+dparams <- list(shape=0.95)
+
+DT.type %>%
+  tidyr::gather(link, bytes, uplink, downlink) %>%
+  ggplot(aes(sample=bytes/1e12)) + stat_qq(distribution=dist, dparams=dparams) +
+  stat_qq_line(distribution=dist, dparams=dparams) +
+  labs(x="Theoretical Quantiles", y="Sample Quantiles", title="Q-Q plot (Weibull, shape=0.95)") +
+  facet_wrap(link~type, scales="free")
+```
+
+```{r}
+DT.type %>%
+  tidyr::gather(link, bytes, uplink, downlink) %>%
+  group_by(type, link) %>%
+  do(broom::tidy(MASS::fitdistr(.$bytes/1e12, "weibull", shape=0.95, lower=1e-3)))
+```
+
+Finally, we show the aggregated traffic distribution per category:
+
+```{r}
+library(dplyr, warn.conflicts = FALSE)
+
+# to convert category IDs into names
+catLookup <- "data/TCPSess_300_2017_service_categ2.csv" %>%
+  readr::read_csv(col_names=c("id", "name", "x", "y"), quote="") %>%
+  dplyr::select(id, name) %>%
+  distinct() %>%
+  mutate(name = setNames(name, id)) %>%
+  pull() %>%
+  c(other = "Other")
+
+catLookup <- catLookup %>%
+  sub("King", "Candy Crush (game)", .) %>%
+  sub("Supercell", "Clash of Clans (game)", .) %>%
+  sub("What's App", "WhatsApp", .) %>%
+  sub("SnapChat", "Snapchat", .)
+```
+
+```{r, fig.asp=.8}
+DT.cat %>%
+  mutate(uplink = uplink / sum(uplink), downlink = downlink / sum(downlink)) %>%
+  mutate(category = catLookup[category]) %>%
+  mutate(category = forcats::fct_reorder(factor(category), downlink)) %>%
+  tidyr::gather(link, bytes, uplink, downlink) %>%
+  arrange(link, category) %>%
+  ggplot(aes(category, bytes*100)) + facet_grid(~link) + coord_flip() +
+  geom_col(aes(fill=rep(c(0, 1), 40))) + labs(x=NULL, y="Traffic [%]") +
+  theme_minimal() + theme(panel.grid.minor.x=element_blank()) + guides(fill=FALSE)
+```
+
+## Correlations
+
+Here we show a *spatial* correlation matrix (i.e., traffic is aggregated by BS per category).
+
+```{r}
+library(corrplot)
+
+sp <- DT.sp %>%
+  tidyr::complete(bs, category, fill=list(uplink=0, downlink=0)) %>%
+  dplyr::select(-uplink) %>%
+  mutate(category = catLookup[category]) %>%
+  tidyr::spread(category, downlink) %>%
+  dplyr::select(-bs)
+
+corrplot(cor(sp), order="FPC", method="color", tl.cex=.6, pch.cex=.6,
+         p.mat=cor.mtest(sp)$p, insig="pch", sig.level=.01)
+```
+
+Here we show a *temporal* correlation matrix (i.e., traffic is aggregated by timestamp per category).
+
+```{r}
+ts <- DT.ts %>%
+  tidyr::complete(ts, category, fill=list(uplink=0, downlink=0)) %>%
+  dplyr::select(-uplink) %>%
+  mutate(category = catLookup[category]) %>%
+  tidyr::spread(category, downlink) %>%
+  dplyr::select(-ts)
+
+corrplot(cor(ts), order="FPC", method="color", tl.cex=.6, pch.cex=.6,
+         p.mat=cor.mtest(ts)$p, insig="pch", sig.level=.01)
+```
+
+# Feature engineering
+
+## Areal consolidation
+
+```{r}
+rm(list=ls())
+invisible(gc())
+```
+
+On the one hand, traffic data are gathered per BS, for which we define Voronoi areas around them. On the other hand, income and population data are gathered per IRIS zone. Moreover, these two different partitions have heterogeneous sizes, with BS zones generally being smaller than IRIS zones in urban centres, and an inverted relationship in the countryside and less-populated areas. Therefore, we need to consolidate a common basis for the area space.
+
+The aim of this section is to generate a map (many-to-one) of BS zones to IRIS zones plus a set of associated areal weights (a procedure known as [*areal weighted interpolation*](https://cran.r-project.org/web/packages/areal/vignettes/areal-weighted-interpolation.html)), to be able to transform traffic counts from BS to IRIS zones.
+
+First off, we
+
+- load the geographical data (and fix some holes), `france.iris`.
+- generate useful geographical aggregates, `france.insee` and `france`.
+- generate a Voronoi tessellation of BSs, limited by France's bounds, `france.bs`.
+
+```{r}
+library(dplyr, warn.conflicts = FALSE)
+library(raster)
+library(rgeos)
+
+path <- "data/france.RData"
+
+if (file.exists(path)) load(path) else {
+  # function to compute the Voronoi tessellation
+  voronoi_polys <- function(bs, proj4string) {
+    bs <- bs %>%
+      arrange(bs_id) %>%
+      # duplicated locations are filtered out
+      group_by(lon, lat) %>%
+      slice(1) %>%
+      ungroup()
+    
+    w <- deldir::tile.list(deldir::deldir(bs$lon, bs$lat))
+    
+    lapply(seq_along(w), function(i) {
+      tmp <- cbind(w[[i]]$x, w[[i]]$y)
+      Polygons(list(Polygon(rbind(tmp, tmp[1,]))), ID=i)
+    }) %>%
+      SpatialPolygons(proj4string=proj4string) %>%
+      SpatialPolygonsDataFrame(as.data.frame(bs))
+  }
+  
+  shp <- file.path("data", "CONTOURS-IRIS_2-1__SHP__FRA_2017-06-30",
+                   "CONTOURS-IRIS", "1_DONNEES_LIVRAISON_2016",
+                   "CONTOURS-IRIS_2-1_SHP_LAMB93_FE-2016", "CONTOURS-IRIS.shp")
+  
+  # load the shapefile and fix some holes
+  france.iris <- shapefile(shp) %>% gBuffer(byid=TRUE, width=0)
+  
+  # spatial aggregations
+  france.insee <- aggregate(france.iris, by="INSEE_COM")
+  france <- aggregate(france.iris)
+  
+  # compute Voronoi tessellation and intersect with France
+  france.bs <- readr::read_csv("data/TCPSess_300_2017_nidt_xy_lonlat.csv") %>%
+    filter(hasdata) %>%
+    voronoi_polys(crs("+proj=longlat +datum=WGS84")) %>%
+    spTransform(crs(france.iris)) %>%
+    intersect(france)
+  
+  save(france, france.iris, france.insee, france.bs, file=path)
+}
+
+rm(france, france.insee) # not needed now
+```
+
+```{r}
+plot(france.bs)
+```
+
+Next, we add areal information and obtain the intersection of BS and IRIS zones.
+
+```{r}
+france.iris$area.iris <- area(france.iris)
+france.bs$area.bs <- area(france.bs)
+
+path <- "data/france.bs.iris.RData"
+
+if (file.exists(path)) load(path) else {
+  library(furrr)
+  plan(multisession, workers=4)
+
+  intersects <- gIntersects(france.bs, france.iris, byid=TRUE, returnDense=FALSE)
+  
+  n <- 1000
+  nr <- nrow(france.bs)
+  france.bs.s <- split(france.bs, rep(1:ceiling(nr/n), each=n, length.out=nr))
+  
+  france.bs.iris <- bind(future_map(france.bs.s, function(x) {
+    yids <- unique(unlist(intersects[as.numeric(row.names(x))]))
+    intersect(x, france.iris[yids,])
+  }, .progress = TRUE))
+  
+  france.bs.iris$area <- area(france.bs.iris)
+  
+  save(france.bs.iris, file=path)
+  rm(intersects, france.bs.s)
+}
+```
+
+The interesting part of this intersection is the data associated.
+
+```{r}
+france.bs.iris@data
+```
+
+Each record defines a sub-area that belongs to a certain BS and IRIS zone intersection. Note that `area.bs` is the total area of the BS polygon, `area` is the smaller sub-area from the intersection with IRIS zones. Therefore, `area/area.bs` is the appropriate areal weight to assign part of the BS traffic to that particular sub-area. We extract this information in the following data frame, augment this mapping with all the duplicated BS positions, and save it for later reuse.
+
+```{r}
+bs.iris <- france.bs.iris@data %>%
+  mutate(weight = area / area.bs) %>%
+  dplyr::select(CODE_IRIS, weight, lon, lat) %>%
+  left_join(
+    filter(readr::read_csv("data/TCPSess_300_2017_nidt_xy_lonlat.csv"), hasdata)) %>%
+  dplyr::select(bs_id, CODE_IRIS, weight)
+
+save(bs.iris, file="data/bs.iris.RData")
+bs.iris
+```
+
+## Traffic data interpolation
+
+```{r}
+rm(list=ls())
+invisible(gc())
+
+load("data/bs.iris.RData")
+load("data/france.RData")
+rm(france, france.insee)
+```
+
+First off, we load the target IRIS zones: those zones for which we have income data from both sources (*déclarés*, *disponibles*), omitting the rows with missing values.
+
+```{r}
+library(dplyr, warn.conflicts = FALSE)
+
+target.iris <- left_join(
+  readxl::read_excel("data/BASE_TD_FILO_DEC_IRIS_2014.xls", skip=5, progress=FALSE),
+  readxl::read_excel("data/BASE_TD_FILO_DISP_IRIS_2014.xls", skip=5, progress=FALSE)
+) %>%
+  dplyr::select(IRIS, DEC_MED14, DISP_MED14) %>%
+  na.omit() %>%
+  pull(IRIS)
+
+summary(target.iris)
+```
+
+As seen before, the income data set only comprises populated urban areas due to privacy reasons. Therefore, it is reasonable to assume that the traffic data generated in each cell was approximately evenly distributed across the cell area. The first step is to filter out those zones with no data.
+
+```{r}
+france.iris.f <- subset(france.iris, CODE_IRIS %in% target.iris)
+bs.iris.f <- subset(bs.iris, CODE_IRIS %in% target.iris)
+france.bs.f <- subset(france.bs, bs_id %in% bs.iris.f$bs_id)
+```
+
+```{r}
+plot(france.iris.f)
+plot(france.bs.f)
+```
+
+```{r, eval=FALSE}
+library(leaflet)
+
+lcrs <- function(x) spTransform(x, crs("+init=epsg:4326"))
+
+leaflet() %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  addPolygons(data=lcrs(france.bs.f), weight=1, fill=FALSE) %>%
+  addPolygons(data=lcrs(france.iris.f), weight=1, fill=FALSE, color="red")
+```
+
+As we can see from the maps after filtering, the target areas are indeed urban areas, which validates our assumption. Finally, we have to merge the weights above with the traffic data.
+
+```{r}
+library(data.table)
+
+cat.byid <- "data/TCPSess_300_2017_service_categ2.csv" %>%
+  readr::read_csv(col_names=c("id", "name", "x", "y"), quote="") %>%
+  dplyr::select(id, name) %>%
+  distinct() %>%
+  bind_rows(list(id="other", name="Other")) %>%
+  arrange(id) %>%
+  pull(name)
+
+name <- "TCPSess_300_2017_0"
+path <- paste0("data/", name, ".hourly.iris.fst")
+
+if (file.exists(path)) DT <- fst::read.fst(path, as.data.table=TRUE) else {
+  library(furrr)
+  plan(multisession, workers=4)
+  
+  files <- Sys.glob(file.path("data", name, "*.hourly.fst"))
+  
+  DT <- rbindlist(future_map(files, function(x) {
+    # load and set category
+    DT <- fst::read.fst(x, as.data.table=TRUE)[
+      , category := strsplit(basename(x), "\\.")[[1]][1]]
+    
+    # rename and filter BSs
+    setnames(DT, "bs", "bs_id")
+    DT <- DT[bs_id %in% bs.iris.f$bs_id,]
+    
+    # interpolate traffic into IRIS zones
+    merge(DT, bs.iris.f, by="bs_id", allow.cartesian=TRUE)[
+      , `:=`(uplink=weight*uplink, downlink=weight*downlink, weight=NULL)][
+      , .(uplink=sum(uplink), downlink=sum(downlink)), 
+      by=.(ts, CODE_IRIS, category)]
+  }, .progress = TRUE))
+  
+  DT[, category := factor(category)]
+  setattr(DT$category, "levels", cat.byid)
+  setkey(DT, ts)
+  
+  fst::write.fst(DT, path)
+}
+```
+
+After this process, the final data set contains hourly uplink/downlink traffic per category and IRIS code.
+
+```{r}
+head(DT)
+```
+
+```{r}
+DT.iris <- DT[,.(traffic=sum(uplink+downlink)), by=CODE_IRIS]
+france.iris.f <- merge(france.iris.f, DT.iris)
+load("data/france.RData")
+```
+
+```{r}
+ggplot() + theme_void() +
+  geom_sf(data=sf::st_as_sf(france.iris.f), lwd=0, fill="black") +
+  geom_sf(data=sf::st_as_sf(france), lwd=.1, fill=NA)
+```
+
+# Income vs. traffic per inhabitant
+
+```{r}
+rm(list=ls())
+invisible(gc())
+
+library(dplyr, warn.conflicts = FALSE)
+library(ggplot2)
+library(data.table)
+
+name <- "TCPSess_300_2017_0"
+path <- paste0("data/", name, ".hourly.iris.fst")
+DT <- fst::read.fst(path, as.data.table=TRUE)
+```
+
+Income and population data have many variables. Let us start simply by considering the median income and total population.
+
+```{r}
+inc.pop <- 
+  readxl::read_excel("data/BASE_TD_FILO_DEC_IRIS_2014.xls", skip=5, progress=FALSE) %>%
+  left_join(
+    readxl::read_excel("data/BASE_TD_FILO_DISP_IRIS_2014.xls", skip=5, progress=FALSE)) %>%
+  left_join(
+    readxl::read_excel("data/base-ic-evol-struct-pop-2015.xls", skip=5, progress=FALSE)) %>%
+  dplyr::select(IRIS, DISP_MED14, P15_POP) %>%
+  rename(CODE_IRIS = IRIS) %>%
+  na.omit()
+
+inc.pop
+```
+
+Filter and normalize data by population for each IRIS zone, to obtain **bytes/inhabitant**.
+
+```{r}
+DT <- subset(DT, CODE_IRIS %in% inc.pop$CODE_IRIS)
+inc.pop <- subset(inc.pop, CODE_IRIS %in% DT$CODE_IRIS)
+
+DT <- merge(DT, inc.pop, by="CODE_IRIS")[, `:=`(
+  uplink=uplink/P15_POP, downlink=downlink/P15_POP, P15_POP=NULL)]
+```
+
+Get the aggregate activity per category and area just for **home hours** (e.g., weekdays between 20-7 h).
+
+```{r}
+is.home.hour <- function(ts, start=18, end=7) {
+  hday <- as.Date(c("2017-05-25", "2017-06-05")) # French holidays
+  wday <- lubridate::wday(ts, label=TRUE, week_start=1)
+  hour <- lubridate::hour(ts)
+  
+  in.interval <- if (start <= end)
+    (hour >= start) & (hour <= end)
+  else (hour >= start) | (hour <= end)
+  
+  in.interval & (wday %in% levels(wday)[1:5]) & !(as.Date(ts) %in% hday)
+}
+
+is.weekend <- function(ts, ...) {
+  lubridate::wday(ts, week_start=1) > 5
+}
+
+DT <- subset(DT, is.home.hour(ts, 20)) # takes too much time
+
+DT <- DT[, .(uplink=sum(uplink), downlink=sum(downlink)),
+         by = .(date=as.Date(ts), CODE_IRIS, category, DISP_MED14)]
+
+path <- paste0("data/", name, ".homeagg.iris.fst")
+fst::write.fst(DT, path)
+```
+
+
+Now, we compute the [Revealed Comparative Advantage](https://en.wikipedia.org/wiki/Revealed_comparative_advantage) (RCA) index as follows:
+
+$$\mathrm{RCA}_{ij} = \frac{T_{ij} / T_i}{T_j / T}$$
+
+where
+
+- $T_ij$ is the traffic/inhabitant in area $i$ for category $j$.
+- $T_i$ is the traffic/inhabitant in area $i$ for all categories.
+- $T_j$ is the traffic/inhabitant for category $j$ in all areas.
+- $T$ is the total traffic/inhabitant, all areas and categories.
+
+```{r}
+path <- paste0("data/", name, ".homeagg.iris.fst")
+DT <- fst::read.fst(path, as.data.table=TRUE)
+
+# aggregates for each zone and category
+DT <- DT[, .(uplink=median(uplink), downlink=median(downlink)),
+         by=.(CODE_IRIS, category, DISP_MED14)]
+
+# T_i, T_j, RCA
+DT[, `:=`(uplink_zon=sum(uplink), downlink_zon=sum(downlink)), by=.(CODE_IRIS)]
+DT[, `:=`(uplink_cat=sum(uplink), downlink_cat=sum(downlink)), by=.(category)]
+DT[, `:=`(
+  uplink = (uplink / uplink_zon) / (uplink_cat / sum(uplink)),
+  downlink = (downlink / downlink_zon) / (downlink_cat / sum(downlink))
+)]
+DT[, `:=`(uplink_cat=NULL, downlink_cat=NULL)]
+```
+
+We first plot median income vs. RCA for the whole dataset to see whether there is any evident global relationship. To deal with overplotting, data is binned in hexagonal regions. The gray scale represents counts in each bin.
+
+```{r}
+melt(DT, measure=c("downlink", "uplink")) %>%
+  ggplot() + theme_classic() +
+  aes(DISP_MED14, value) + facet_wrap("variable", scales="free_y") +
+  geom_hex(bins=100) +
+  scale_fill_gradient(low="#dddddd", high="black", trans="log") +
+  labs(x="Median income (disp) [€]", y="RCA", title="All categories")
+```
+
+There is no evident relationship, but some patterns arise if we explore the data set by category:
+
+```{r}
+for (i in unique(DT$category)) {
+  p <- melt(DT[category == i,], measure=c("uplink", "downlink")) %>%
+    ggplot() + theme_classic() +
+    aes(DISP_MED14, value) + facet_wrap("variable", scales="free_y") +
+    geom_hex(bins=100) +
+    scale_fill_gradient(low="#dddddd", high="black", trans="log") +
+    labs(x="Median income (disp) [€]", y="RCA", title=i)
+  print(p)
+}
+```
+
+Uplink and downlink are highly correlated (at least as aggregates), so we drop the uplink and work with the downlink. First, we convert RCAs per category to wide format, preserving the total downlink for each zone as another feature:
+
+```{r}
+DT[, `:=`(uplink=NULL, uplink_zon=NULL)]
+DT <- dcast(DT, ... ~ category, value.var="downlink", fill=0)
+
+str(DT)
+```
+
+Note that this transformation automatically fills with zeroes those categories without any traffic in a particular zone.
+
+## Random forest
+
+The first step is to initialize the package to make use all the locally available cores, and then convert the data sets to H2OFrames:
+
+```{r}
+library(h2o)
+
+# use all cores
+localH2O <- h2o.init(nthreads = -1)
+
+train <- caret::createDataPartition(DT$DISP_MED14, p=.8, times=1, list=FALSE)
+DT.train.h2o <- as.h2o(DT[train, -1])
+DT.test.h2o <- as.h2o(DT[-train, -1])
+```
+
+```{r}
+rfFit <- h2o.randomForest(x=3:42, y="DISP_MED14", training_frame=DT.train.h2o, ntrees=100,
+                          validation_frame=DT.test.h2o)
+summary(rfFit)
+```
+
+```{r}
+pred <- as.data.frame(predict(rfFit, DT.test.h2o))[[1]]
+hist(pred - DT[-train]$DISP_MED14)
+```
+
+```{r}
+h2o.varimp_plot(rfFit)
+```
+
+## Multicollinearity and feature selection
+
+There are many correlations between variables:
+
+```{r}
+corrplot::corrplot(
+  cor(DT[,-(1:3)]), order="FPC", method="color", tl.cex=.6, pch.cex=.6,
+  p.mat=corrplot::cor.mtest(DT[,-(1:3)])$p, insig="pch", sig.level=.01)
+```
+
+And multicollinearity is a huge issue:
+
+```{r}
+# drop one, e.g. VOIP (43), to avoid perfect fit
+mctest::mctest(as.matrix(DT[, -c(1:3, 43)]), DT[[2]], "b")
+```
+
+We may want to hand-pick some of them. First, let's list our variables:
+
+```{r}
+names(DT)[-c(1:3)]
+```
+
+We can manually remove some of them for various reasons:
+
+- Pokemon Go: it was just a passing fad.
+- No info, Other, Others: we don't know what they contain.
+- Ads: something that the user consumes indirectly.
+- Updates: usually, they are automatic.
+- Encrypted web, Generic web: too generic, non-informative.
+
+```{r}
+handpicked <- c("Pokemon Go", 
+                "No info", "Other", "Others", 
+                "Ads", 
+                "Updates", 
+                "Encrypted web", "Generic web")
+
+sel <- c(names(DT)[1:3], handpicked)
+```
+
+Let's perform some multicollinearity tests:
+
+```{r}
+mctest::mctest(as.matrix(DT[, -..sel]), DT[[2]], "b")
+```
+
+Collinearity seem to be more or less under control after dropping those variables.
+
+## Generalised Linear Model
+
+1. Interactions
+
+Summary: RF's improved performance (in terms of MAE) suggested that it may be capturing some interactions, so I've been exploring pairwise interactions between traffic categories. But it turns out that the GLM always gets worse, so I've discarded this idea. Actually, this does make sense, because there would be no reasonable explanation, i.e., data traffic in one category, in principle, has no way of interacting with other traffic. Anyway, it was worth checking.
+
+2. Regularization tuning
+
+Summary: The H2O library applies alpha=0.5 by default, which means that the result is an average between Ridge and Lasso. So my guess was that there were two possibilities: 1) Ridge and Lasso perform similarly in this data set, or 2) one of them is better. In fact, Lasso (which performs feature selection; Ridge does not) gets much better results, and just setting alpha=1, **we go from R2=0.42 to R2=0.56**.
+
+3. Weighted regression
+
+Summary: We were feeding the total downlink traffic as another variable. Instead, if we use this as a set of weights for the GLM, **we go from R2=0.56 to R2=0.60**.
+
+```{r}
+netFit <- glmnet::glmnet(as.matrix(DT[,-..sel]), DT[[2]], weights=DT[[3]])
+netFit$dev.ratio[which.min(netFit$lambda)]
+```
+
+```{r}
+x <- coef(netFit, s=which.min(netFit$lambda))
+df <- data.frame(names=x@Dimnames[[1]], coefficients=0, stringsAsFactors=FALSE)
+df$coefficients[x@i+1] <- x@x
+df <- df[-1,] # remove intercept
+df$sign <- factor(sign(df$coefficients))
+# standardize and reorder
+df$coefficients <- abs(df$coefficients) * 
+  apply(as.matrix(DT[,-..sel]), 2, sd) / sd(DT[[2]])
+df <- df[order(df$coefficients, decreasing=TRUE),]
+
+ggplot(df) + theme_classic() +
+  aes(forcats::fct_rev(forcats::fct_inorder(names)), coefficients, fill=sign) +
+  geom_col() + coord_flip() +
+  labs(title="Standardized Coef. Magnitudes", x=NULL)
+```
+
+## Multi-response GLM
+
+Summary: Our response variable was just the median income, but the shape of the income distribution may encode important information. So I've tried multi-response regression using all the deciles as target variables, and **we go from R2=0.60 to R2=0.63**.
+
+```{r}
+inc <- 
+  readxl::read_excel("data/BASE_TD_FILO_DISP_IRIS_2014.xls", skip=5, progress=FALSE) %>%
+  #dplyr::select(IRIS, DISP_Q114, DISP_Q314) %>%
+  dplyr::select(IRIS, DISP_D114, DISP_D214, DISP_D314, DISP_D414, DISP_D614, DISP_D714, DISP_D814, DISP_D914) %>%
+  rename(CODE_IRIS = IRIS) %>%
+  na.omit()
+
+#DT <- DT[, c(1, 47, 2:42)]
+DT <- merge(DT, inc, by="CODE_IRIS")
+DT <- DT[, c(1, 3:43, 44:47, 2, 48:51)]
+```
+
+```{r}
+mnetFit <- glmnet::glmnet(as.matrix(DT[,3:42][,-..sel[-(1:3)]]), 
+                          as.matrix(DT[,43:51]), 
+                          family="mgaussian", weights=DT[[2]])
+mnetFit$dev.ratio[which.min(mnetFit$lambda)]
+```
+
+```{r}
+plot(mnetFit, xvar = "lambda", label = TRUE, type.coef = "2norm")
+```
+
+```{r}
+w <- DT[[2]] / sum(DT[[2]])
+
+r2 <- sapply(1:9, function(x) {
+  1 - sum(w * (DT[[x+42]] - predict(mnetFit, as.matrix(DT[,3:42][,-..sel[-(1:3)]]), which.min(netFit$lambda))[,x,])^2) /
+    sum(w * (DT[[x+42]] - weighted.mean(DT[[x+42]], w))^2)
+})
+
+plot(r2, type="b", xlab="decile")
+```
+
+```{r}
+dfs <- lapply(1:9, function(i) {
+  x <- coef(mnetFit, s=which.min(mnetFit$lambda))[[i]]
+  df <- data.frame(names=x@Dimnames[[1]], coefficients=0, stringsAsFactors=FALSE)
+  df$coefficients[x@i+1] <- x@x
+  df <- df[-1,] # remove intercept
+  # standardize
+  df$coefficients <- df$coefficients * 
+    apply(as.matrix(DT[,3:42][,-..sel[-(1:3)]]), 2, sd) / sd(DT[[i+42]])
+  df
+})
+df <- bind_rows(dfs, .id="decile")
+
+main <- dfs[[5]][order(abs(dfs[[5]]$coefficients), decreasing=TRUE),]$names[1:10]
+
+ggplot(filter(df, names %in% main)) + theme_classic() +
+  aes(forcats::fct_inorder(decile), abs(coefficients), color=names, group=names, fill=names) +
+  geom_line() + geom_point(shape=21, colour="white", size=1.5, stroke=1.5) +
+  labs(title="Standardized Coef. Magnitudes", x="decile") +
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        axis.line.x=element_blank(), panel.grid.major.x=element_line(color="gray"))
+```
+
+### Inequality
+
+```{r}
+library(furrr)
+plan(multisession, workers=12)
+
+params <- future_pmap(DT[,2:10], function(...) {
+  dec <- seq(0.1, 0.9, 0.1)
+  suppressMessages(suppressWarnings(
+    rriskDistributions::get.lnorm.par(dec, c(...), show.output=FALSE, plot=FALSE)))
+})
+
+DISP_var <- purrr::map_dbl(params, ~ (exp(.x[2]^2) - 1) * exp(2*.x[1] + .x[2]^2))
+DISP_gini <- purrr::map_dbl(params, ~ 2 * pnorm(.x[2]/2 * sqrt(2)) - 1) # erf(s/2)
+```
+
+```{r}
+nona <- !is.na(DISP_var)
+netFit <- glmnet::glmnet(as.matrix(DT[,3:42][,-..sel[-(1:3)]])[nona,], sqrt(DISP_var[nona]), weights=DT[[2]][nona])
+netFit$dev.ratio[which.min(netFit$lambda)]
+```
+
+```{r}
+x <- coef(netFit, s=which.min(netFit$lambda))
+df <- data.frame(names=x@Dimnames[[1]], coefficients=0, stringsAsFactors=FALSE)
+df$coefficients[x@i+1] <- x@x
+df <- df[-1,] # remove intercept
+df$sign <- factor(sign(df$coefficients))
+# standardize and reorder
+df$coefficients <- abs(df$coefficients) * apply(as.matrix(DT[,3:42][,-..sel[-(1:3)]]), 2, sd)
+df <- df[order(df$coefficients, decreasing=TRUE),]
+
+ggplot(df) + theme_classic() +
+  aes(forcats::fct_rev(forcats::fct_inorder(names)), coefficients, fill=sign) +
+  geom_col() + coord_flip() +
+  labs(title="Standardized Coef. Magnitudes", x=NULL)
+```
+
+```{r}
+netFit <- glmnet::glmnet(as.matrix(DT[,3:42][,-..sel[-(1:3)]])[nona,], DISP_gini[nona], weights=DT[[2]][nona])
+netFit$dev.ratio[which.min(netFit$lambda)]
+```
+
+```{r}
+x <- coef(netFit, s=which.min(netFit$lambda))
+df <- data.frame(names=x@Dimnames[[1]], coefficients=0, stringsAsFactors=FALSE)
+df$coefficients[x@i+1] <- x@x
+df <- df[-1,] # remove intercept
+df$sign <- factor(sign(df$coefficients))
+# standardize and reorder
+df$coefficients <- abs(df$coefficients) * apply(as.matrix(DT[,3:42][,-..sel[-(1:3)]]), 2, sd)
+df <- df[order(df$coefficients, decreasing=TRUE),]
+
+ggplot(df) + theme_classic() +
+  aes(forcats::fct_rev(forcats::fct_inorder(names)), coefficients, fill=sign) +
+  geom_col() + coord_flip() +
+  labs(title="Standardized Coef. Magnitudes", x=NULL)
+```
+
+```{r}
+DT <- DT[, c(1, 47, 2:42)]
+```
+
+## PCA analysis
+
+```{r}
+DT.pca <- prcomp(DT[,-..sel], center=TRUE, scale.=TRUE)
+```
+
+```{r}
+ggbiplot::ggscreeplot(DT.pca) + theme_classic()
+```
+
+```{r}
+ggbiplot::ggbiplot(DT.pca, obs.scale=1, alpha=0.5) +
+  aes(color=DT$DISP_MED14) + theme_classic() +
+  scale_color_gradientn(colors=rainbow(5)) +
+  xlim(-10, 10) + ylim(-10, 10)
+```
+
+### Weighted
+
+```{r}
+DT.pca <- prcomp(corpcor::wt.scale(DT[,-..sel], DT[[3]]), center=F, scale.=F)
+```
+
+```{r}
+ggbiplot::ggscreeplot(DT.pca) + theme_classic()
+```
+
+```{r}
+ggbiplot::ggbiplot(DT.pca, obs.scale=1, alpha=0.3) +
+  aes(color=DT$DISP_MED14) + theme_classic() +
+  scale_color_gradientn(colors=rainbow(5)) +
+  xlim(-5, 5) + ylim(-5, 5)
+```
+
+With cuts:
+
+```{r}
+ggbiplot::ggbiplot(DT.pca, obs.scale=1, alpha=0.5) +
+  aes(color=cut(DT$DISP_MED14, 4)) + theme_classic() +
+  scale_color_viridis_d(direction=-1) +
+  xlim(-5, 5) + ylim(-5, 5)
+```
+
+## Census data
+
+```{r}
+POP <- readxl::read_excel("data/base-ic-evol-struct-pop-2015.xls", skip=5, progress=FALSE)
+POP <- POP[, c(1, 13, 24:29, 61, 82)] # 14:23, 24:29 56(estudios superiores)
+POP[,3:ncol(POP)] <- POP[,3:ncol(POP)]/POP[[2]]
+DT.POP <- merge(DT, POP[,c(1, 4:ncol(POP))], by.x="CODE_IRIS", by.y="IRIS")
+```
+
+```{r}
+mctest::mctest(as.matrix(DT.POP[,-..sel]), DT[[2]], "b")
+```
+
+```{r}
+netFit <- glmnet::glmnet(as.matrix(DT.POP[,-..sel]), DT[[2]], weights=DT[[3]])
+netFit$dev.ratio[which.min(netFit$lambda)]
+```
+
+```{r}
+x <- coef(netFit, s=which.min(netFit$lambda))
+df <- data.frame(names=x@Dimnames[[1]], coefficients=0, stringsAsFactors=FALSE)
+df$coefficients[x@i+1] <- x@x
+df <- df[-1,] # remove intercept
+df$sign <- factor(sign(df$coefficients))
+# standardize and reorder
+df$coefficients <- abs(df$coefficients) * 
+  apply(as.matrix(DT.POP[,-..sel]), 2, sd) / sd(DT[[2]])
+df <- df[order(df$coefficients, decreasing=TRUE),]
+
+ggplot(df) + theme_classic() +
+  aes(forcats::fct_rev(forcats::fct_inorder(names)), coefficients, fill=sign) +
+  geom_col() + coord_flip() +
+  labs(title="Standardized Coef. Magnitudes", x=NULL)
+```
+
+## Ideas
+
+- Inequality: sd/mean
+
+- Poner como respuesta el empleo
+
+
+
+
+- ANOVA entre modelo sin o con variables: https://stats.stackexchange.com/a/346163
+
+- correlograma en forma de grafo (`qgraph`), corrr
+
+- Ver cómo y dónde se producen las desviaciones (marginal / predicción?) para ver si merece la pena tener una respuesta binned y cómo se pueden hacer esas categorías.
+
+- Double GLM: segundo GLM para predecir las desviaciones del primero.
+
+- Visualización animada clustering: https://gist.github.com/JEFworks/343d704e26da1d1138be6bb8eb400c6c
+
+- Time series data (features, clustering...):
+    - https://cran.r-project.org/web/packages/tsfeatures/vignettes/tsfeatures.html
+    - https://petolau.github.io/TSrepr-time-series-representations/
+    - https://petolau.github.io/Multiple-data-streams-clustering-in-r/
